@@ -1,0 +1,16 @@
+<!doctype html><meta charset="utf-8">
+<title>Stock Heat — Avon Automotive</title>
+<div id="out" style="font:14px system-ui;padding:16px"></div>
+<script>
+(async()=>{
+  const r = await fetch('/api/vehicles-top');
+  const rows = await r.json();
+  const out = document.getElementById('out');
+  out.innerHTML = '<h2>Hottest Vehicles (Leads/Day)</h2>' + rows.map(x => `
+    <div style="margin:8px 0;padding:8px;border:1px solid #eee;border-radius:8px">
+      <div><b>${x.title||'—'}</b> — £${(x.price||0).toLocaleString()} — ${x.fuel||''} ${x.transmission||''}</div>
+      <div>Leads: ${x.leads_count||0} · Leads/day: ${x.leads_per_day?Number(x.leads_per_day).toFixed(2):'—'}</div>
+      <a href="${x.vdp_url}" target="_blank">View Vehicle</a>
+    </div>`).join('');
+})();
+</script>
