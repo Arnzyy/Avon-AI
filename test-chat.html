@@ -1,0 +1,33 @@
+<!doctype html><meta charset="utf-8">
+<title>Avon Test Chat</title>
+<style>body{font:14px system-ui;margin:20px;}input,button{font:14px;padding:6px}</style>
+
+<h2>Inventory quick test</h2>
+<input id="q" placeholder="e.g. petrol automatic under 17000"><button onclick="search()">Search</button>
+<pre id="inv"></pre>
+
+<h2>Finance quick test</h2>
+<label>Cash price £ <input id="price" type="number" value="15995"></label>
+<label>Deposit £ <input id="dep" type="number" value="2000"></label>
+<label>Term (mo) <input id="term" type="number" value="60"></label>
+<button onclick="fin()">Quote</button>
+<pre id="fx"></pre>
+
+<script>
+async function search(){
+  const q = document.getElementById('q').value;
+  const body = { dealer:'avon' };
+  if (q) body.q = q;
+  const r = await fetch('/api/inventory', { method:'POST', body: JSON.stringify(body) });
+  inv.textContent = JSON.stringify(await r.json(), null, 2);
+}
+async function fin(){
+  const b = {
+    cashPrice: Number(price.value||0),
+    deposit: Number(dep.value||0),
+    termMonths: Number(term.value||60)
+  };
+  const r = await fetch('/api/finance', { method:'POST', body: JSON.stringify(b) });
+  fx.textContent = JSON.stringify(await r.json(), null, 2);
+}
+</script>
