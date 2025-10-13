@@ -1,4 +1,6 @@
 {
+  "name": "avon-ai",
+  "private": true,
   "type": "module",
   "dependencies": {
     "@supabase/supabase-js": "^2.46.1",
