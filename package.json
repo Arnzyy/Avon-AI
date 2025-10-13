@@ -1,1 +1,10 @@
-{ "type":"module", "dependencies": { "@supabase/supabase-js":"2.x", "cheerio":"1.x" } }
+{
+  "name": "avon-ai",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "dependencies": {
+    "@supabase/supabase-js": "^2.46.1",
+    "cheerio": "^1.0.0-rc.12"
+  }
+}
