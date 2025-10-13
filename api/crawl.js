@@ -1,74 +1,129 @@
-import * as cheerio from 'cheerio';
+import cheerio from 'cheerio';
 import { createClient } from '@supabase/supabase-js';
 
-const sb = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE || process.env.SUPABASE_ANON_KEY
-);
+const sb = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY);
 
-const UA = { headers: { "User-Agent": "AvonCrawler/1.0" } };
-const sleep = ms => new Promise(r => setTimeout(r, ms));
-const re = { money: /£\s?([\d,]+(?:\.\d{1,2})?)/i, miles: /([\d,]+)\s*miles/i };
-const pick = (t, rx) => (t.match(rx) || [])[1] || null;
+// helpers
+const abs = (base, href='') => {
+  try { return new URL(href, base).toString(); } catch { return href; }
+};
+const parsePrice = (s='') => {
+  const m = String(s).replace(/[, ]/g,'').match(/£?\s?(\d{3,7})/);
+  return m ? Number(m[1]) : null;
+};
+const norm = s => String(s||'').replace(/\s+/g,' ').trim();
 
-export default async function handler(req, res) {
-  try {
-    const u = new URL(req.url, 'http://x');
-    const dealerId = u.searchParams.get('dealer') || 'avon';
-    const { data: d } = await sb.from('dealers').select('*').eq('id', dealerId).single();
+async function fetchHTML(url){
+  const r = await fetch(url, { headers: { 'user-agent':'Mozilla/5.0 AvonBot' }});
+  const html = await r.text();
+  return cheerio.load(html);
+}
 
-    if (!d) return res.status(400).json({ ok: false, error: "Dealer not found" });
+export default async function handler(req,res){
+  try{
+    const dealer = String((req.query.dealer||'avon')).toLowerCase();
 
-    const base = d.site_url.replace(/\/$/, '');
-    const links = new Set();
+    // 1) read dealer config
+    const { data: d, error: derr } = await sb
+      .from('dealers').select('*').eq('id', dealer).single();
+    if (derr || !d) throw new Error('dealer not found');
 
-    for (const path of d.list_paths || []) {
-      const html = await (await fetch(base + path, UA)).text();
-      const $ = cheerio.load(html);
-      $('a[href]').each((_, a) => {
-        const href = ($(a).attr('href') || '').trim();
-        if (!href) return;
-        const abs = href.startsWith('http') ? href : base + (href.startsWith('/') ? href : '/' + href);
-        if (/\/used\/cars\//.test(abs) && !/[?&]page=/.test(abs)) links.add(abs);
+    const base = d.site_url;
+    const listPaths = Array.isArray(d.list_paths) ? d.list_paths : [];
+
+    const items = [];
+    const seen = new Set();
+
+    // 2) crawl each listing page, extract car cards
+    for (const path of listPaths){
+      const url = abs(base, path);
+      const $ = await fetchHTML(url);
+
+      // try common card patterns, and fall back to any used-car link with price nearby
+      const candidates = new Set();
+
+      // obvious cards
+      $('[class*="vehicle"], [class*="stock"], [class*="card"], li, article, .result, .srp, .listing').each((_,el)=>{
+        const a = $(el).find('a[href*="/used/"], a[href*="/vehicle"], a[href*="/cars/"]').first();
+        if (a.length){
+          const href = abs(base, a.attr('href'));
+          if (!href.includes('#') && !seen.has(href)) candidates.add(el);
+        }
+      });
+
+      // generic anchors if nothing matched
+      if (candidates.size === 0){
+        $('a[href*="/used/"], a[href*="/vehicle"], a[href*="/cars/"]').each((_,a)=>{
+          const href = abs(base, $(a).attr('href'));
+          if (!href.includes('#') && !seen.has(href)) candidates.add(a);
+        });
+      }
+
+      for (const el of candidates){
+        const $el = $(el);
+        const a = $el.is('a') ? $el : $el.find('a[href]').first();
+        const href = abs(base, a.attr('href')||'');
+        if (!href || seen.has(href)) continue;
+
+        // title
+        let title = norm(a.text() || $el.find('h3,h2,.title').first().text());
+        if (!title || /used cars in/i.test(title)) {
+          // try parent text
+          title = norm($el.text()).slice(0,140);
+        }
+
+        // price: closest text with £
+        let priceText = '';
+        const priceNode = $el.find(':contains("£")').filter((_,n)=>/\£\s?\d/.test($(n).text())).first();
+        priceText = priceNode.text() || a.text() || $el.text();
+        const price = parsePrice(priceText);
+
+        // attrs
+        const blockText = norm($el.text()).toLowerCase();
+        const fuel = (blockText.match(/\b(petrol|diesel|hybrid|electric)\b/)||[])[0] || null;
+        let transmission = (blockText.match(/\b(automatic|manual|auto)\b/)||[])[0] || null;
+        if (transmission === 'auto') transmission = 'automatic';
+        const ulez = /ulez|ul ez/.test(blockText);
+
+        // sanity checks
+        if (!price || price < 500 || price > 200000) continue; // skip junk/headers
+        if (!title || title.length < 5) continue;
+
+        seen.add(href);
+        items.push({
+          dealer_id: dealer,
+          url: href,
+          title,
+          price,
+          fuel,
+          transmission,
+          ulez
+        });
+      }
+    }
+
+    // 3) upsert into vehicles & snapshot
+    for (const v of items){
+      const attrs = { fuel: v.fuel, transmission: v.transmission, ulez: !!v.ulez, url: v.url };
+      await sb.rpc('upsert_vehicle_from_crawl', {
+        p_dealer: v.dealer_id,
+        p_vdp_url: v.url,
+        p_title: v.title,
+        p_price: v.price,
+        p_attrs: attrs
       });
     }
 
-    const items = [];
-
-    for (const vdp of Array.from(links).slice(0, 250)) {
-      try {
-        await sleep(300);
-        const page = await (await fetch(vdp, UA)).text();
-        const $ = cheerio.load(page);
-        const text = $.root().text().replace(/\s+/g, ' ');
-        const title = ($('h1').first().text() || '').trim();
-        const priceAttr = $('[itemprop="price"]').attr('content') || '';
-        const priceMatch = priceAttr || pick(text, re.money) || '';
-        const price = Number(String(priceMatch).replace(/,/g, ''));
-        if (!title || !price || Number.isNaN(price)) continue;
-        const mileage = Number((pick(text, re.miles) || '0').replace(/,/g, ''));
-        const fuel = $('td:contains("Fuel Type")').next().text().trim() || (text.match(/(Petrol|Diesel|Hybrid|Electric)/i)?.[1] || '');
-        const transmission = $('td:contains("Transmission")').next().text().trim() || (text.match(/(Manual|Automatic|Auto)/i)?.[1] || '');
-        const ulez = /ULEZ\s*Compliant/i.test(text);
-        items.push({ url: vdp, title, price, mileage, fuel, transmission, ulez });
-
-        await sb.rpc('upsert_vehicle_from_crawl', {
-          p_dealer: dealerId,
-          p_vdp_url: vdp,
-          p_title: title,
-          p_price: price,
-          p_attrs: { mileage, fuel, transmission, ulez }
-        });
-      } catch { }
+    if (items.length){
+      await sb.from('inventory_snapshots').upsert({
+        dealer_id: dealer,
+        payload: items.map(i=>({ url:i.url, title:i.title, price:i.price, fuel:i.fuel, transmission:i.transmission, ulez:i.ulez })),
+        updated_at: new Date().toISOString()
+      });
     }
 
-    await sb.from('inventory_snapshots').upsert(
-      { dealer_id: dealerId, payload: items, updated_at: new Date().toISOString() },
-      { onConflict: 'dealer_id' }
-    );
-
-    res.json({ ok: true, dealer: dealerId, count: items.length });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: String(e) });
+    res.json({ ok:true, dealer, count: items.length });
+  }catch(e){
+    res.status(500).json({ ok:false, error:String(e) });
   }
 }
