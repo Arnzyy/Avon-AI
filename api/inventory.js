@@ -1,38 +1,38 @@
 import { createClient } from '@supabase/supabase-js';
+const sb = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY);
 
-const sb = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_ANON_KEY
-);
+export default async function handler(req,res){
+  try{
+    const body = req.method === 'POST' ? JSON.parse(req.body||'{}') : {};
+    const { q, make, maxPrice, fuel, transmission, ulez, dealer='avon' } = body;
 
-export default async function handler(req, res) {
-  try {
-    const body = req.method === "POST" ? JSON.parse(req.body || "{}") : {};
-    const dealer = body.dealer || 'avon';
-
-    // get the latest crawled stock snapshot
-    const { data, error } = await sb
-      .from('inventory_snapshots')
-      .select('payload')
+    let query = sb.from('vehicles')
+      .select('title, price, attrs, vdp_url')
       .eq('dealer_id', dealer)
-      .single();
+      .order('price', { ascending: true })
+      .limit(25);
 
-    if (error) return res.status(500).json({ ok:false, error: String(error.message) });
+    if (q) query = query.ilike('title', `%${q}%`);
+    if (make) query = query.ilike('title', `%${make}%`);
+    if (maxPrice) query = query.lte('price', Number(maxPrice));
+    if (fuel) query = query.contains('attrs', { fuel });
+    if (transmission) query = query.contains('attrs', { transmission });
+    if (typeof ulez === 'boolean') query = query.contains('attrs', { ulez });
 
-    let results = data?.payload || [];
-    const toLower = v => String(v || '').toLowerCase();
+    const { data, error } = await query;
+    if (error) throw error;
 
-    const { q, make, maxPrice, fuel, transmission, ulez } = body;
+    const rows = (data||[]).map(r => ({
+      title: r.title,
+      price: r.price,
+      url: r.vdp_url,
+      fuel: r.attrs?.fuel || null,
+      transmission: r.attrs?.transmission || null,
+      ulez: !!r.attrs?.ulez
+    }));
 
-    if (q) results = results.filter(v => toLower(v.title).includes(toLower(q)));
-    if (make) results = results.filter(v => toLower(v.title).includes(toLower(make)));
-    if (maxPrice) results = results.filter(v => (v.price || 0) <= Number(maxPrice));
-    if (fuel) results = results.filter(v => toLower(v.fuel) === toLower(fuel));
-    if (transmission) results = results.filter(v => toLower(v.transmission) === toLower(transmission));
-    if (typeof ulez === 'boolean') results = results.filter(v => !!v.ulez === ulez);
-
-    res.json(results.slice(0, 12)); // return up to 12 matches
-  } catch (e) {
+    res.json({ ok:true, results: rows });
+  }catch(e){
     res.status(500).json({ ok:false, error:String(e) });
   }
 }
