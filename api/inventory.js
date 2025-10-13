@@ -1,43 +1,62 @@
+// /api/inventory.js
 import { createClient } from '@supabase/supabase-js';
-const sb = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY);
+
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  // Server-side only — do NOT use the anon key here.
+  process.env.SUPABASE_SERVICE_ROLE,
+  { auth: { persistSession: false }, global: { headers: { 'x-application-name': 'avon-ai' } } }
+);
+
+function numberFromText(text) {
+  // Pulls the largest number as a price (e.g. "under 15000" -> 15000)
+  const nums = (text?.match(/\d{3,}/g) || []).map(n => parseInt(n, 10)).filter(Boolean);
+  if (!nums.length) return null;
+  return Math.max(...nums);
+}
 
 export default async function handler(req, res) {
   try {
-    const body = req.method === 'POST' ? JSON.parse(req.body || '{}') : {};
-    const { q, make, maxPrice, fuel, transmission, ulez, dealer = 'avon' } = body;
+    const { q = '', maxPrice, fuel, ulez } = req.query;
 
-    // Build base query from vehicles table
-    let query = sb
+    // Base select
+    let query = supabase
       .from('vehicles')
-      .select('title, price, attrs, vdp_url')
-      .eq('dealer_id', dealer)
+      .select('id, dealer_id, title, price, vdp_url, attrs', { count: 'exact' })
       .order('price', { ascending: true })
-      .limit(25);
+      .limit(50);
 
-    // Apply filters dynamically
+    // Simple text match against title
     if (q) query = query.ilike('title', `%${q}%`);
-    if (make) query = query.ilike('title', `%${make}%`);
-    if (maxPrice) query = query.lte('price', Number(maxPrice));
-    if (fuel) query = query.contains('attrs', { fuel });
-    if (transmission) query = query.contains('attrs', { transmission });
-    if (typeof ulez === 'boolean') query = query.contains('attrs', { ulez });
+
+    // Max price: from query param or extract from text
+    const cap = maxPrice ? Number(maxPrice) : numberFromText(q);
+    if (cap) query = query.lte('price', cap);
+
+    // Filter by fuel if provided (works with jsonb "attrs" column)
+    if (fuel) query = query.ilike('attrs->>fuel', `%${fuel}%`);
+
+    // Filter by ULEZ if provided (expects boolean-ish in attrs.ulez)
+    if (ulez === 'true') query = query.eq('attrs->>ulez', 'true');
+    if (ulez === 'false') query = query.eq('attrs->>ulez', 'false');
 
     const { data, error } = await query;
     if (error) throw error;
 
-    // Format the results cleanly
-    const rows = (data || []).map((r) => ({
-      title: r.title,
-      price: r.price,
-      url: r.vdp_url,
-      fuel: r.attrs?.fuel || null,
-      transmission: r.attrs?.transmission || null,
-      ulez: !!r.attrs?.ulez,
+    const results = (data || []).map(row => ({
+      id: row.id,
+      title: row.title,
+      price: row.price,
+      url: row.vdp_url,              // <- your real VDP URL
+      fuel: row?.attrs?.fuel ?? null,
+      transmission: row?.attrs?.transmission ?? null,
+      ulez: row?.attrs?.ulez ?? null,
+      dealer_id: row.dealer_id
     }));
 
-    res.json({ ok: true, results: rows });
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ ok: false, error: String(e) });
+    return res.status(200).json({ ok: true, count: results.length, results });
+  } catch (err) {
+    console.error('inventory error', err);
+    return res.status(500).json({ ok: false, error: String(err?.message || err) });
   }
 }
