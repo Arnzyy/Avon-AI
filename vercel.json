@@ -1,8 +1,10 @@
 {
-  "routes": [
-    { "src": "^/$", "dest": "/test-chat.html" }
-  ],
-  "crons": [
-    { "path": "/api/crawl?dealer=avon", "schedule": "0 0 * * *" }
-  ]
+  "name": "avon-ai",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "dependencies": {
+    "@supabase/supabase-js": "^2.46.1",
+    "cheerio": "^1.0.0-rc.12"
+  }
 }
