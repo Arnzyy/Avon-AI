@@ -3,49 +3,46 @@ import { createClient } from '@supabase/supabase-js';
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE,
+  process.env.SUPABASE_ANON_KEY, // read-only is fine here
   { auth: { persistSession: false } }
 );
 
-function numberFromText(text) {
-  const nums = (text?.match(/\d{3,}/g) || []).map(n => parseInt(n, 10)).filter(Boolean);
-  return nums.length ? Math.max(...nums) : null;
-}
-
 export default async function handler(req, res) {
   try {
-    const { q = '' } = req.query;
+    const dealer = (req.query.dealer || 'avon').toString().trim();
+    const q = (req.query.q || '').toString().trim();
+    const limit = Math.min(parseInt(req.query.limit || '25', 10), 100);
 
     let query = supabase
       .from('vehicles')
-      .select('id, dealer_id, title, price, vdp_url, attrs', { count: 'exact' })
+      .select('id, dealer_id, vdp_url, title, price, attrs')
+      .eq('dealer_id', dealer)
       .order('price', { ascending: true })
-      .limit(50);
+      .limit(limit);
 
-    // Search by text in title
-    if (q) query = query.ilike('title', `%${q}%`);
-
-    // Optional: detect "under £..." queries
-    const cap = numberFromText(q);
-    if (cap) query = query.lte('price', cap);
+    if (q) {
+      // simple keyword search
+      query = query.or(
+        `title.ilike.%${q}%,attrs->>fuel.ilike.%${q}%,attrs->>transmission.ilike.%${q}%`
+      );
+    }
 
     const { data, error } = await query;
     if (error) throw error;
 
-    const results = (data || []).map(row => ({
-      id: row.id,
-      title: row.title,
-      price: row.price,
-      url: row.vdp_url,
-      dealer: row.dealer_id,
-      fuel: row.attrs?.fuel || null,
-      ulez: row.attrs?.ulez || null,
-      mileage: row.attrs?.mileage || null
+    const results = (data || []).map((v) => ({
+      title: v.title,
+      price: v.price,
+      url: v.vdp_url,
+      attrs: v.attrs || {},
+      ulez: !!(v.attrs && v.attrs.ulez)
     }));
 
-    return res.status(200).json({ ok: true, results });
+    res.status(200).json({ ok: true, results });
   } catch (err) {
-    console.error('inventory error', err);
-    return res.status(500).json({ ok: false, error: err.message });
+    console.error(err);
+    res
+      .status(500)
+      .json({ ok: false, error: err.message || 'inventory error', results: [] });
   }
 }
