@@ -1,0 +1,57 @@
+<!doctype html><meta charset="utf-8" />
+<title>Avon Assistant (Demo)</title>
+<style>
+  body{font:16px system-ui, -apple-system, Segoe UI, Roboto; background:#f6f7fb; margin:0}
+  header{position:sticky;top:0;background:#0f172a;color:#fff;padding:14px 18px;font-weight:600}
+  #wrap{max-width:820px;margin:0 auto;padding:16px}
+  #log{background:#fff;border:1px solid #e5e7eb;border-radius:14px;min-height:420px;padding:16px;overflow:auto}
+  .msg{margin:8px 0;display:flex;gap:10px}
+  .me .bubble{background:#1e293b;color:#fff}
+  .bot .bubble{background:#e5e7eb}
+  .bubble{padding:12px 14px;border-radius:14px;max-width:76%}
+  #bar{display:flex;gap:8px;margin-top:10px}
+  input,button{font:16px;padding:10px 12px}
+  input{flex:1;border:1px solid #cbd5e1;border-radius:12px}
+  button{border:0;border-radius:12px;background:#0ea5e9;color:white;font-weight:600;cursor:pointer}
+  .hint{font-size:13px;color:#64748b;margin-top:8px}
+  a{color:#0ea5e9}
+</style>
+<header>Avon Assistant — demo</header>
+<div id="wrap">
+  <div id="log"></div>
+  <div id="bar">
+    <input id="q" placeholder="Ask about stock or finance… e.g. “qashqai petrol automatic under £15,000”" />
+    <button onclick="send()">Send</button>
+  </div>
+  <div class="hint">Try: <em>“show electric cars under £20,000”</em> • <em>“finance £12995 deposit £1000 term 48 months”</em></div>
+</div>
+
+<script>
+const log = document.getElementById('log');
+function add(role, text) {
+  const div = document.createElement('div');
+  div.className = 'msg ' + (role === 'me' ? 'me' : 'bot');
+  const b = document.createElement('div');
+  b.className = 'bubble';
+  b.innerText = text;
+  div.appendChild(b);
+  log.appendChild(div);
+  log.scrollTop = log.scrollHeight;
+}
+add('bot', "Hi! I can check stock, ULEZ, and give example finance figures. Ask me something or type a budget/make/fuel.");
+
+async function send(){
+  const t = document.getElementById('q').value.trim();
+  if (!t) return;
+  document.getElementById('q').value = '';
+  add('me', t);
+  try {
+    const r = await fetch('/api/chat', { method:'POST', body: JSON.stringify({ message: t }) });
+    const j = await r.json();
+    add('bot', j.reply || (j.error ? ("Error: " + j.error) : "Sorry, I didn’t get that."));
+  } catch(e) {
+    add('bot', 'Network error, please try again.');
+  }
+}
+document.getElementById('q').addEventListener('keydown', e => { if (e.key==='Enter') send(); });
+</script>
