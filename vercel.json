@@ -1,5 +1,11 @@
 {
+  "functions": {
+    "api/**.js": {
+      "runtime": "nodejs18.x",
+      "maxDuration": 60
+    }
+  },
   "routes": [
-    { "src": "^/$", "dest": "/test-chat.html" }
+    { "src": "^/api/(.*)", "dest": "/api/$1" }
   ]
 }
