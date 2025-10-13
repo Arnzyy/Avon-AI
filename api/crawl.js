@@ -1,129 +1,91 @@
-import cheerio from 'cheerio';
 import { createClient } from '@supabase/supabase-js';
+import * as cheerio from 'cheerio';
 
-const sb = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY);
+// Initialize Supabase
+const sb = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE);
 
-// helpers
-const abs = (base, href='') => {
-  try { return new URL(href, base).toString(); } catch { return href; }
-};
-const parsePrice = (s='') => {
-  const m = String(s).replace(/[, ]/g,'').match(/£?\s?(\d{3,7})/);
-  return m ? Number(m[1]) : null;
-};
-const norm = s => String(s||'').replace(/\s+/g,' ').trim();
+export default async function handler(req, res) {
+  try {
+    const dealer = req.query.dealer || 'avon';
 
-async function fetchHTML(url){
-  const r = await fetch(url, { headers: { 'user-agent':'Mozilla/5.0 AvonBot' }});
-  const html = await r.text();
-  return cheerio.load(html);
-}
+    // Get dealer config from Supabase
+    const { data: dealers, error } = await sb
+      .from('dealers')
+      .select('*')
+      .eq('id', dealer)
+      .limit(1);
 
-export default async function handler(req,res){
-  try{
-    const dealer = String((req.query.dealer||'avon')).toLowerCase();
+    if (error) throw error;
+    if (!dealers?.length) throw new Error(`Dealer not found: ${dealer}`);
 
-    // 1) read dealer config
-    const { data: d, error: derr } = await sb
-      .from('dealers').select('*').eq('id', dealer).single();
-    if (derr || !d) throw new Error('dealer not found');
+    const dealerData = dealers[0];
+    const urls = dealerData.list_paths || [];
 
-    const base = d.site_url;
-    const listPaths = Array.isArray(d.list_paths) ? d.list_paths : [];
+    let vehicles = [];
 
-    const items = [];
-    const seen = new Set();
+    // Crawl all stock list pages
+    for (const path of urls) {
+      const pageUrl = `${dealerData.site_url}${path}`;
+      console.log(`Fetching: ${pageUrl}`);
 
-    // 2) crawl each listing page, extract car cards
-    for (const path of listPaths){
-      const url = abs(base, path);
-      const $ = await fetchHTML(url);
+      const response = await fetch(pageUrl);
+      const html = await response.text();
+      const $ = cheerio.load(html);
 
-      // try common card patterns, and fall back to any used-car link with price nearby
-      const candidates = new Set();
+      // Detect vehicle cards (Avon Automotive uses .vehicle-listing)
+      $('.vehicle, .vehicle-listing, .car, .stock-listing, .vehicle-card').each((_, el) => {
+        const title =
+          $(el).find('h2, .title, .vehicle-title, .vehicle__title').text().trim() ||
+          'Unknown vehicle';
 
-      // obvious cards
-      $('[class*="vehicle"], [class*="stock"], [class*="card"], li, article, .result, .srp, .listing').each((_,el)=>{
-        const a = $(el).find('a[href*="/used/"], a[href*="/vehicle"], a[href*="/cars/"]').first();
-        if (a.length){
-          const href = abs(base, a.attr('href'));
-          if (!href.includes('#') && !seen.has(href)) candidates.add(el);
+        const priceText =
+          $(el).find('.price, .vehicle-price, .vehicle__price').text().replace(/[^\d]/g, '') || '0';
+        const price = Number(priceText);
+
+        const link = $(el).find('a').attr('href');
+        const fullUrl =
+          link && link.startsWith('http')
+            ? link
+            : link
+            ? `${dealerData.site_url}${link}`
+            : null;
+
+        if (title && fullUrl && price > 0) {
+          vehicles.push({
+            dealer_id: dealer,
+            title,
+            price,
+            vdp_url: fullUrl,
+            attrs: {
+              fuel: $(el).text().toLowerCase().includes('diesel')
+                ? 'Diesel'
+                : $(el).text().toLowerCase().includes('petrol')
+                ? 'Petrol'
+                : 'Unknown',
+              transmission: $(el).text().toLowerCase().includes('auto')
+                ? 'Auto'
+                : $(el).text().toLowerCase().includes('manual')
+                ? 'Manual'
+                : 'Unknown',
+              ulez: $(el).text().toLowerCase().includes('ulez'),
+            },
+          });
         }
       });
-
-      // generic anchors if nothing matched
-      if (candidates.size === 0){
-        $('a[href*="/used/"], a[href*="/vehicle"], a[href*="/cars/"]').each((_,a)=>{
-          const href = abs(base, $(a).attr('href'));
-          if (!href.includes('#') && !seen.has(href)) candidates.add(a);
-        });
-      }
-
-      for (const el of candidates){
-        const $el = $(el);
-        const a = $el.is('a') ? $el : $el.find('a[href]').first();
-        const href = abs(base, a.attr('href')||'');
-        if (!href || seen.has(href)) continue;
-
-        // title
-        let title = norm(a.text() || $el.find('h3,h2,.title').first().text());
-        if (!title || /used cars in/i.test(title)) {
-          // try parent text
-          title = norm($el.text()).slice(0,140);
-        }
-
-        // price: closest text with £
-        let priceText = '';
-        const priceNode = $el.find(':contains("£")').filter((_,n)=>/\£\s?\d/.test($(n).text())).first();
-        priceText = priceNode.text() || a.text() || $el.text();
-        const price = parsePrice(priceText);
-
-        // attrs
-        const blockText = norm($el.text()).toLowerCase();
-        const fuel = (blockText.match(/\b(petrol|diesel|hybrid|electric)\b/)||[])[0] || null;
-        let transmission = (blockText.match(/\b(automatic|manual|auto)\b/)||[])[0] || null;
-        if (transmission === 'auto') transmission = 'automatic';
-        const ulez = /ulez|ul ez/.test(blockText);
-
-        // sanity checks
-        if (!price || price < 500 || price > 200000) continue; // skip junk/headers
-        if (!title || title.length < 5) continue;
-
-        seen.add(href);
-        items.push({
-          dealer_id: dealer,
-          url: href,
-          title,
-          price,
-          fuel,
-          transmission,
-          ulez
-        });
-      }
     }
 
-    // 3) upsert into vehicles & snapshot
-    for (const v of items){
-      const attrs = { fuel: v.fuel, transmission: v.transmission, ulez: !!v.ulez, url: v.url };
-      await sb.rpc('upsert_vehicle_from_crawl', {
-        p_dealer: v.dealer_id,
-        p_vdp_url: v.url,
-        p_title: v.title,
-        p_price: v.price,
-        p_attrs: attrs
-      });
+    if (vehicles.length === 0) {
+      throw new Error(`No vehicles found for dealer ${dealer}`);
     }
 
-    if (items.length){
-      await sb.from('inventory_snapshots').upsert({
-        dealer_id: dealer,
-        payload: items.map(i=>({ url:i.url, title:i.title, price:i.price, fuel:i.fuel, transmission:i.transmission, ulez:i.ulez })),
-        updated_at: new Date().toISOString()
-      });
-    }
+    // Insert into Supabase
+    const { error: insertError } = await sb.from('vehicles').insert(vehicles);
+    if (insertError) throw insertError;
 
-    res.json({ ok:true, dealer, count: items.length });
-  }catch(e){
-    res.status(500).json({ ok:false, error:String(e) });
+    res.json({ ok: true, dealer, count: vehicles.length });
+  } catch (e) {
+    // 🧩 Error logging (safe and visible in Vercel logs)
+    console.error('crawl error:', e);
+    res.status(500).json({ ok: false, error: String(e) });
   }
 }
