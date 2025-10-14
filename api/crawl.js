@@ -1,144 +1,230 @@
 // /api/crawl.js
 import * as cheerio from 'cheerio';
-import { admin } from './_supabase.js';
+import { supabase } from '../../lib/supabase';
 
-const ABSOLUTE = /^(https?:)?\/\//i;
+const MAX_PAGES = parseInt(process.env.CRAWL_MAX_PAGES || '5', 10);
 
-// crude helpers ----------------------------------------------------
-const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-const toAbs = (base, href) => {
-  try {
-    if (!href) return null;
-    if (ABSOLUTE.test(href)) return new URL(href).toString();
-    return new URL(href, base).toString();
-  } catch { return null; }
-};
-
-// grab £price from text
-const parsePrice = (txt) => {
-  if (!txt) return null;
-  const m = txt.replace(/[, ]+/g,'').match(/£?(\d{3,7})/i);
-  return m ? parseInt(m[1], 10) : null;
-};
-
-// infer simple attrs from title/snippet
-const inferAttrs = (title, blob) => {
-  const s = `${title ?? ''} ${blob ?? ''}`.toLowerCase();
-  return {
-    fuel: /diesel/.test(s) ? 'Diesel' : /petrol|gasoline/.test(s) ? 'Petrol' : undefined,
-    ulez: /ulez|euro\s*6/.test(s) ? true : undefined
-  };
-};
-
-// extract products from a listing page (generic)
-function extractListings(html, baseUrl) {
-  const $ = cheerio.load(html);
-  const cards = [];
-
-  // Try to find cards with <a> links to used cars; fall back to all anchors on page
-  const anchors = $('a[href]').toArray();
-
-  for (const a of anchors) {
-    const href = $(a).attr('href');
-    const abs = toAbs(baseUrl, href);
-    if (!abs) continue;
-
-    // accept links under same domain + likely vehicle paths
-    if (!abs.startsWith(new URL(baseUrl).origin)) continue;
-    if (!/used|cars|vehicle|stock/i.test(abs)) continue;
-
-    // Title: anchor text or nearest heading
-    let title = $(a).text().trim();
-    if (!title) {
-      title = $(a).closest('article,li,div').find('h2,h3,h4').first().text().trim();
+/**
+ * Very small fetch with retry (handle brief timeouts).
+ */
+async function getHtml(url, tries = 3) {
+  let lastErr;
+  for (let i = 0; i < tries; i += 1) {
+    try {
+      const res = await fetch(url, {
+        headers: { 'User-Agent': 'Mozilla/5.0 (compatible; AvonBot/1.0)' },
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return await res.text();
+    } catch (err) {
+      lastErr = err;
+      await new Promise(r => setTimeout(r, 400 + i * 600));
     }
-    if (!title) continue;              // require a title to avoid garbage
-
-    // gather nearby text to hunt for price/attrs
-    const cardRoot = $(a).closest('article,li,div').first();
-    const textBlob = cardRoot.text().replace(/\s+/g, ' ').trim();
-    const price = parsePrice(textBlob);
-
-    cards.push({
-      title,
-      vdp_url: abs,
-      price,
-      attrs: inferAttrs(title, textBlob)
-    });
   }
-
-  // Deduplicate on vdp_url
-  const dedup = new Map();
-  for (const c of cards) {
-    if (!dedup.has(c.vdp_url)) dedup.set(c.vdp_url, c);
-  }
-  return [...dedup.values()];
+  throw lastErr;
 }
 
-// -----------------------------------------------------------------
+/**
+ * Parse one listing page -> array of VDP links.
+ * We try several reasonable selectors to be resilient.
+ */
+function extractCardLinks($, base) {
+  const links = new Set();
+
+  // Most common: each card contains a heading link
+  $('a[href*="/used/"]').each((_, a) => {
+    const href = $(a).attr('href') || '';
+    // Only keep DETAIL pages, not category pages
+    // Detail pages typically look like .../used/.../<id> or .../used/.../<slug>
+    if (/\/used\//.test(href) && !/\/used\/(cars|vans|vehicles)\/?$/.test(href)) {
+      const abs = href.startsWith('http') ? href : new URL(href, base).href;
+      links.add(abs);
+    }
+  });
+
+  return [...links];
+}
+
+/**
+ * Given a vehicle detail page, extract structured data.
+ */
+function parseVDP($, url) {
+  const textAll = $('body').text().replace(/\s+/g, ' ').toLowerCase();
+
+  // Title
+  let title =
+    $('h1, .vehicle-title, .title, .heading').first().text().trim() ||
+    $('meta[property="og:title"]').attr('content') ||
+    $('title').text().trim();
+
+  // Price
+  let priceText =
+    $('[class*="price"], .price, .vehicle-price, .heading-price')
+      .first()
+      .text()
+      .replace(/[, ]/g, '') || '';
+
+  // fallback: some dealers keep price in meta
+  if (!/\d/.test(priceText)) {
+    priceText = $('meta[itemprop="price"]').attr('content') || '';
+  }
+
+  const price = parseInt((priceText.match(/(\d{3,})/) || [])[1] || '0', 10) || null;
+
+  // ULEZ (best-effort detection)
+  const ulez =
+    /ulez/.test(textAll) && !/non[- ]?compliant/.test(textAll)
+      ? true
+      : /ulez\s*(?:compliant|yes|✓|✔)/.test(textAll);
+
+  // Fuel (best-effort)
+  let fuel =
+    (/electric|ev/i.test(textAll) && 'Electric') ||
+    (/hybrid/i.test(textAll) && 'Hybrid') ||
+    (/diesel/i.test(textAll) && 'Diesel') ||
+    (/petrol|gasoline/i.test(textAll) && 'Petrol') ||
+    null;
+
+  // Gearbox (best-effort)
+  let transmission =
+    (/auto(matic)?/i.test(textAll) && 'Auto') ||
+    (/manual/i.test(textAll) && 'Manual') ||
+    null;
+
+  // Mileage
+  const mileageMatch = textAll.match(/(\d{1,3}(?:,\d{3})+|\d{4,})\s*(miles|mi|ml|km)/i);
+  let mileage = null;
+  if (mileageMatch) {
+    mileage = parseInt(mileageMatch[1].replace(/,/g, ''), 10);
+  }
+
+  // attrs json
+  const attrs = {
+    fuel,
+    transmission,
+    ulez: !!ulez,
+    mileage,
+  };
+
+  return { title, price, attrs, vdp_url: url };
+}
+
+/**
+ * Crawl a single list path (pagination supported, up to MAX_PAGES).
+ */
+async function crawlListPath(baseUrl, listPath, dealerId) {
+  const out = [];
+  for (let page = 1; page <= MAX_PAGES; page += 1) {
+    const url = new URL(listPath, baseUrl);
+    // If your site uses query pagination, add here (e.g., ?page=2)
+    if (page > 1) url.searchParams.set('page', String(page));
+
+    let html;
+    try {
+      html = await getHtml(url.href);
+    } catch (e) {
+      // Stop paginating if we get errors after first page
+      if (page === 1) throw e;
+      break;
+    }
+
+    const $ = cheerio.load(html);
+    const vdpLinks = extractCardLinks($, baseUrl);
+
+    // If no links on page 1 => this path likely invalid
+    if (!vdpLinks.length) {
+      if (page === 1) {
+        // allow continuing next path
+      }
+      break;
+    }
+
+    // Visit each VDP and extract details
+    for (const vdp of vdpLinks) {
+      try {
+        const vdpHtml = await getHtml(vdp);
+        const $$ = cheerio.load(vdpHtml);
+        const rec = parseVDP($$, vdp);
+
+        if (rec.title && rec.vdp_url) {
+          out.push({
+            dealer_id: dealerId,
+            vdp_url: rec.vdp_url,
+            title: rec.title,
+            price: rec.price,
+            attrs: rec.attrs,
+          });
+        }
+      } catch {
+        // ignore one-off failures
+      }
+    }
+  }
+  return out;
+}
 
 export default async function handler(req, res) {
   try {
-    const dealer = (req.query.dealer || req.query.id || 'avon').toString().toLowerCase();
-    const supa = admin();
+    const dealer = (req.query.dealer || req.body?.dealer || 'avon').toString();
 
-    // 1) read dealer config
-    const { data: dealerRow, error: dErr } = await supa
+    // 1) get this dealer's list paths from DB
+    const { data: dealerRow, error: dealerErr } = await supabase
       .from('dealers')
-      .select('id, site_url, list_paths, rep_apr, finance_apply_url')
+      .select('id, site_url, list_paths')
       .eq('id', dealer)
       .single();
 
-    if (dErr || !dealerRow) {
-      return res.status(404).json({ ok: false, error: 'Dealer not found', details: dErr });
+    if (dealerErr || !dealerRow) {
+      return res.status(404).json({ ok: false, error: 'Dealer not found' });
     }
 
-    const siteBase = dealerRow.site_url.replace(/\/+$/, '');
-    const paths = Array.isArray(dealerRow.list_paths) ? dealerRow.list_paths : [];
+    const baseUrl = dealerRow.site_url;
+    const listPaths = Array.isArray(dealerRow.list_paths) ? dealerRow.list_paths : [];
 
-    if (!paths.length) {
-      return res.status(400).json({ ok: false, error: 'Dealer has no list_paths configured.' });
+    if (!listPaths.length) {
+      return res.status(400).json({ ok: false, error: 'Dealer has no list_paths' });
     }
 
-    let found = 0;
-    for (const p of paths) {
-      const url = toAbs(siteBase + '/', p);
-      if (!url) continue;
+    // 2) Crawl each path
+    let all = [];
+    for (const p of listPaths) {
+      const batch = await crawlListPath(baseUrl, p, dealer);
+      all = all.concat(batch);
+    }
 
-      // polite delay
-      await sleep(400);
+    if (!all.length) {
+      return res.json({ ok: true, dealer, upserted: 0, note: 'No stock discovered' });
+    }
 
-      const resp = await fetch(url, { headers: { 'User-Agent': 'avon-ai-crawler/1.0' } });
-      if (!resp.ok) continue;
+    // 3) Upsert to vehicles (unique on vdp_url)
+    const now = new Date().toISOString();
 
-      const html = await resp.text();
-      const items = extractListings(html, url);
+    // Upsert in small chunks to avoid payload limits
+    const chunkSize = 100;
+    let upserted = 0;
 
-      // upsert into vehicles unique on vdp_url
-      if (items.length) {
-        const rows = items.map(v => ({
-          dealer_id: dealerRow.id,
-          vdp_url: v.vdp_url,
-          title: v.title,
-          price: v.price ?? null,
-          attrs: v.attrs ?? {}
-        }));
+    for (let i = 0; i < all.length; i += chunkSize) {
+      const chunk = all.slice(i, i + chunkSize).map(v => ({
+        ...v,
+        first_seen: now,           // if col exists it will keep earliest via SQL default/trigger
+        last_seen: now,
+      }));
 
-        const { error: upErr } = await supa
-          .from('vehicles')
-          .upsert(rows, { onConflict: 'vdp_url' });
+      const { error } = await supabase
+        .from('vehicles')
+        .upsert(chunk, { onConflict: 'vdp_url' }); // IMPORTANT: unique on vdp_url
 
-        if (upErr) {
-          console.error('Upsert error:', upErr);
-        } else {
-          found += rows.length;
-        }
+      if (error) {
+        // continue next chunk; log error
+        console.error('upsert error', error);
+      } else {
+        upserted += chunk.length;
       }
     }
 
-    return res.json({ ok: true, dealer, count: found });
-  } catch (e) {
-    console.error(e);
-    return res.status(500).json({ ok: false, error: e.message });
+    return res.json({ ok: true, dealer, upserted });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ ok: false, error: String(err?.message || err) });
   }
 }
