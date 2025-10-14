@@ -1,0 +1,7 @@
+{
+  "rewrites": [
+    { "source": "/", "destination": "/chat.html" }
+  ],
+  "cleanUrls": true,
+  "trailingSlash": false
+}
