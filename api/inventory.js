@@ -1,61 +1,58 @@
-// api/inventory.js
-import { createClient } from '@supabase/supabase-js';
+// /api/inventory.js
+import { supabase } from "../lib/supabase.js";
 
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE // needs read access
-);
+const DEFAULT_DEALER = "avon";
 
-function sanitizeIlike(str = '') {
-  // escape % and _ so they behave as literals
-  return str.replace(/[%_]/g, s => '\\' + s);
+function parseQuery(q) {
+  if (!q) return [];
+  return q
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]/gu, " ")
+    .split(/\s+/)
+    .filter(Boolean);
 }
 
 export default async function handler(req, res) {
   try {
-    const dealer = (req.query.dealer || 'avon').toLowerCase();
-    const q = (req.query.q || '').trim();
+    const dealer = (req.query.dealer || DEFAULT_DEALER).toLowerCase();
+    const q = (req.query.q || "").trim();
 
+    // If nothing provided, just show newest
     let query = supabase
-      .from('vehicles')
-      .select('id,dealer_id,vdp_url,title,price,attrs,first_seen_at', { count: 'exact' })
-      .eq('dealer_id', dealer)
-      .order('first_seen_at', { ascending: false })
-      .limit(50);
+      .from("vehicles")
+      .select("dealer_id, vdp_url, title, price, attrs, first_seen", { count: "exact" })
+      .eq("dealer_id", dealer)
+      .order("first_seen", { ascending: false, nullsFirst: false })
+      .limit(24);
 
-    if (q) {
-      const s = sanitizeIlike(q);
-      // Search across title, URL and attrs make/model
-      // NOTE: Supabase .or() uses comma-separated filters
-      query = query.or(
-        [
-          `title.ilike.%${s}%`,
-          `vdp_url.ilike.%${s}%`,
-          `attrs->>make.ilike.%${s}%`,
-          `attrs->>model.ilike.%${s}%`
-        ].join(',')
-      );
+    const tokens = parseQuery(q);
+    for (const t of tokens) {
+      // Each token must appear EITHER in title OR vdp_url
+      // Multiple .or() calls are ANDed with the previous filters in Supabase
+      query = query.or(`title.ilike.%${t}%,vdp_url.ilike.%${t}%`);
     }
 
     const { data, error, count } = await query;
-    if (error) throw error;
+    if (error) {
+      console.error("[inventory] error:", error.message);
+      return res.status(500).json({ ok: false, error: error.message });
+    }
 
-    const results = (data || []).map(row => ({
-      title: row.title,
-      price: row.price,
-      url: row.vdp_url,
-      ulez: row?.attrs?.ulez ?? null,
-      fuel: row?.attrs?.fuel ?? null,
-      transmission: row?.attrs?.transmission ?? null,
-      dealer: row.dealer_id
-    }));
-
-    res.status(200).json({ ok: true, dealer, count, results });
-  } catch (err) {
-    console.error('inventory error:', err);
-    res.status(200).json({
-      ok: false,
-      error: err.message || String(err)
+    return res.json({
+      ok: true,
+      dealer,
+      q,
+      count: count ?? data?.length ?? 0,
+      results: (data || []).map((r) => ({
+        title: r.title || null,
+        url: r.vdp_url,
+        price: r.price ?? null,
+        attrs: r.attrs || null,
+        first_seen: r.first_seen || null
+      }))
     });
+  } catch (e) {
+    console.error("[inventory] fatal:", e);
+    return res.status(500).json({ ok: false, error: String(e) });
   }
 }
