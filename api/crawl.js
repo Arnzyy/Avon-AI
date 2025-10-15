@@ -1,228 +1,160 @@
 // /api/crawl.js
-// Node 18 / ESM (package.json has "type": "module")
+// Crawl listing pages and upsert vehicle VDP URLs into Supabase.
+//
+// Notes:
+// - Uses Cheerio ESM correctly: import { load } from "cheerio";
+// - Reads dealer config (site_url, list_paths) from public.dealers if present.
+// - Falls back to defaults for "avon" dealer.
+// - Upserts into public.vehicles on conflict vdp_url.
+// - Keep it simple: we record (dealer_id, vdp_url, title, attrs). Price/title can
+//   be improved later once your selectors are finalized.
 
 import { load } from "cheerio";
-import { createClient } from "@supabase/supabase-js";
+import { supabase } from "../lib/supabase.js"; // path from /api to /lib
 
-// --------- Config ---------
-const {
-  SUPABASE_URL,
-  SUPABASE_SERVICE_ROLE,     // service key for write
-  CRON_KEY,                  // optional shared secret for the endpoint
-} = process.env;
+// --- Fallback config for Avon Automotive (used if dealers row is missing) ---
+const DEFAULT_DEALER = "avon";
+const DEFAULT_SITE = "https://www.avon-automotive.com";
+const DEFAULT_LIST_PATHS = [
+  "/used/cars/bristol",
+  "/used/cars",
+  "/used" // belt-and-braces
+];
 
-if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE) {
-  throw new Error("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE");
-}
-
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE, {
-  auth: { persistSession: false },
-});
-
-// Small utility to sleep between fetches (be kind to the dealer site)
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-// Normalise text -> integer (price / mileage)
-function toInt(text) {
-  if (!text) return null;
-  const m = String(text).replace(/[,£]/g, "").match(/\d+/g);
-  if (!m) return null;
-  return parseInt(m.join(""), 10);
-}
-
-// Safe fetch with proper UA
-async function fetchHtml(url) {
-  const res = await fetch(url, {
-    headers: {
-      "user-agent":
-        "Mozilla/5.0 (compatible; AvonAI/1.0; +https://avon-ai.vercel.app)",
-      accept: "text/html,application/xhtml+xml",
-    },
-  });
-  if (!res.ok) {
-    throw new Error(`Fetch failed ${res.status} for ${url}`);
+// Helpful: normalize and build absolute URLs
+const abs = (base, href) => {
+  try {
+    return new URL(href, base).toString();
+  } catch {
+    return null;
   }
-  return await res.text();
+};
+
+// Pick only /used/ vehicle-like links and normalize
+function extractVDPUrls($, baseUrl) {
+  const urls = new Set();
+
+  // broad match for anything that looks like a used-vehicle link
+  $('a[href*="/used/"]').each((_, a) => {
+    const href = $(a).attr("href");
+    const url = abs(baseUrl, href);
+    if (!url) return;
+
+    // optionally filter out listing pages if they have obvious patterns,
+    // keep the test simple for now – we only dedupe later
+    urls.add(url);
+  });
+
+  return [...urls];
 }
 
-// Extract VDP links from a listing page
-function extractVdpLinks(listHtml, baseUrl) {
-  const $ = cheerio.load(listHtml);
-  const hrefs = new Set();
+// Extract a passable title from card/link, fallback to page <title>
+function guessTitle($, linkEl, pageTitle) {
+  const t =
+    ($(linkEl).attr("title") || $(linkEl).text() || "").trim() ||
+    (pageTitle || "").trim();
+  return t || null;
+}
 
-  // 1) Anchors that look like used car detail pages
-  $("a[href]").each((_, a) => {
-    let href = $(a).attr("href");
-    if (!href) return;
+export default async function handler(req, res) {
+  try {
+    const dealer = (req.query.dealer || DEFAULT_DEALER).toLowerCase();
 
-    // Make absolute
-    if (href.startsWith("/")) {
-      href = new URL(href, baseUrl).href;
-    } else if (!href.startsWith("http")) {
-      // relative like "./detail"
-      try {
-        href = new URL(href, baseUrl).href;
-      } catch {
-        return;
+    // 1) Try to load dealer config from DB
+    let siteUrl = DEFAULT_SITE;
+    let listPaths = DEFAULT_LIST_PATHS;
+
+    const { data: dealerRow, error: dealerErr } = await supabase
+      .from("dealers")
+      .select("id, site_url, list_paths")
+      .eq("id", dealer)
+      .maybeSingle();
+
+    if (dealerErr) {
+      console.warn("[crawl] dealers fetch error:", dealerErr.message);
+    }
+    if (dealerRow) {
+      siteUrl = dealerRow.site_url || siteUrl;
+      if (Array.isArray(dealerRow.list_paths) && dealerRow.list_paths.length) {
+        listPaths = dealerRow.list_paths;
       }
     }
 
-    // Heuristic: your site uses /used/ in VDPs
-    if (/\/used\//i.test(href)) {
-      hrefs.add(href.split("#")[0]);
-    }
-  });
+    // 2) Crawl each listing path and collect candidate VDP URLs
+    const headers = { "user-agent": "Mozilla/5.0 (compatible; AvonAI/1.0)" };
+    const discovered = new Set();
 
-  return Array.from(hrefs);
-}
+    for (const path of listPaths) {
+      const url = abs(siteUrl, path);
+      if (!url) continue;
 
-// Extract data from a VDP page (best-effort & resilient)
-function extractVehicleFromVdp(html, vdpUrl) {
-  const $ = load(html);
-
-  // Title: og:title or h1 fallback
-  const ogTitle = $('meta[property="og:title"]').attr("content");
-  const title = (ogTitle || $("h1").first().text() || "").trim();
-
-  // Price: common patterns on dealer sites
-  let priceText =
-    $('meta[itemprop="price"]').attr("content") ||
-    $('[data-test="price"]').text() ||
-    $('[class*="price"]').first().text() ||
-    $("body").text();
-  const price = toInt(priceText);
-
-  // Mileage (not all pages have)
-  const mileageText =
-    $('[class*="mileage"]').first().text() ||
-    $("body:contains('miles')").text().match(/[\d,]+\s*miles/i)?.[0];
-  const mileage = toInt(mileageText);
-
-  // Fuel (simple heuristics)
-  let fuel = null;
-  const bodyText = $("body").text().toLowerCase();
-  if (bodyText.includes("diesel")) fuel = "Diesel";
-  else if (bodyText.includes("petrol")) fuel = "Petrol";
-  else if (bodyText.includes("electric")) fuel = "Electric";
-  else if (bodyText.includes("hybrid")) fuel = "Hybrid";
-
-  // ULEZ (simple contains)
-  const ulez = /ulez/i.test(html);
-
-  return {
-    vdp_url: vdpUrl,
-    title: title || null,
-    price: price ?? null,
-    attrs: {
-      fuel: fuel ?? null,
-      mileage: mileage ?? null,
-      ulez: ulez,
-    },
-  };
-}
-
-// Upsert a single vehicle into public.vehicles
-async function upsertVehicle(dealerId, vehicle) {
-  // Ensure the payload matches your table columns
-  const row = {
-    dealer_id: dealerId,
-    vdp_url: vehicle.vdp_url,
-    title: vehicle.title,
-    price: vehicle.price,
-    attrs: vehicle.attrs ?? {},
-  };
-
-  const { error } = await supabase
-    .from("vehicles")
-    .upsert(row, { onConflict: "dealer_id,vdp_url" })
-    .select("id")
-    .single();
-
-  if (error) throw error;
-}
-
-// Get dealer record (or all) from Supabase
-async function getDealer(dealerId) {
-  const { data, error } = await supabase
-    .from("dealers")
-    .select("id, site_url, list_paths, rep_apr, finance_apply_url")
-    .eq("id", dealerId)
-    .single();
-
-  if (error) throw error;
-  if (!data || !data.list_paths || data.list_paths.length === 0) {
-    throw new Error(`Dealer ${dealerId} is missing list_paths`);
-  }
-  return data;
-}
-
-// --------- API Handler ---------
-export default async function handler(req, res) {
-  try {
-    // Allow GET only
-    if (req.method !== "GET") {
-      res.setHeader("Allow", "GET");
-      return res.status(405).json({ ok: false, error: "Method Not Allowed" });
-    }
-
-    // Simple auth (optional)
-    const key = req.query.key || req.headers["x-cron-key"];
-    if (CRON_KEY && key !== CRON_KEY) {
-      return res.status(401).json({ ok: false, error: "Unauthorized" });
-    }
-
-    const dealerId = (req.query.dealer || "avon").toLowerCase();
-
-    // 1) Read dealer config
-    const dealer = await getDealer(dealerId);
-
-    let totalFound = 0;
-    let totalUpserts = 0;
-    const allVdps = new Set();
-
-    // 2) Crawl each listing path
-    for (const path of dealer.list_paths) {
-      const listUrl = new URL(path, dealer.site_url).href;
-
-      let html;
-      try {
-        html = await fetchHtml(listUrl);
-      } catch (err) {
-        console.error("List fetch failed:", listUrl, err.message);
+      const resp = await fetch(url, { headers });
+      if (!resp.ok) {
+        console.warn(`[crawl] listing fetch failed ${url} -> ${resp.status}`);
         continue;
       }
 
-      const links = extractVdpLinks(html, dealer.site_url);
-      links.forEach((u) => allVdps.add(u));
+      const html = await resp.text();
+      const $ = load(html);
 
-      // Small delay between listing pages
-      await sleep(300);
+      const pageUrls = extractVDPUrls($, siteUrl);
+      pageUrls.forEach((u) => discovered.add(u));
     }
 
-    totalFound = allVdps.size;
+    const vdpUrls = [...discovered];
 
-    // 3) Visit each VDP and upsert
-    for (const vdp of allVdps) {
+    // 3) Build rows to upsert
+    // Try to get a shallow title by fetching the VDP quickly
+    // (optional: you can skip titles entirely to make it faster)
+    const rows = [];
+    for (const url of vdpUrls) {
+      let title = null;
       try {
-        const vdpHtml = await fetchHtml(vdp);
-        const vehicle = extractVehicleFromVdp(vdpHtml, vdp);
-        await upsertVehicle(dealerId, vehicle);
-        totalUpserts += 1;
-      } catch (err) {
-        console.error("VDP failed:", vdp, err.message);
+        const vdpResp = await fetch(url, { headers });
+        if (vdpResp.ok) {
+          const html = await vdpResp.text();
+          const $ = load(html);
+          // basic guess: use the <title> tag
+          title = ($("title").text() || "").trim() || null;
+        }
+      } catch {
+        /* ignore VDP fetch errors; we still store URL */
       }
-      // avoid hammering the site
-      await sleep(350);
+
+      rows.push({
+        dealer_id: dealer,
+        vdp_url: url,
+        title,
+        // You can add more fields as needed. price can stay null.
+        attrs: { source: "crawl", dealer }
+        // first_seen is handled by DB default (now())
+      });
     }
 
-    return res.status(200).json({
+    if (!rows.length) {
+      return res.json({ ok: true, dealer, site: siteUrl, found: 0, upserted: 0 });
+    }
+
+    // 4) Upsert into vehicles on vdp_url uniqueness
+    const { data: upserted, error: upsertErr } = await supabase
+      .from("vehicles")
+      .upsert(rows, { onConflict: "vdp_url" }) // unique index exists
+      .select("vdp_url");
+
+    if (upsertErr) {
+      console.error("[crawl] upsert error:", upsertErr.message);
+      return res.status(500).json({ ok: false, error: upsertErr.message });
+    }
+
+    return res.json({
       ok: true,
-      dealer: dealerId,
-      totalFound,
-      totalUpserts,
+      dealer,
+      site: siteUrl,
+      found: vdpUrls.length,
+      upserted: upserted?.length || 0
     });
   } catch (err) {
-    console.error("crawl error", err);
-    return res.status(500).json({ ok: false, error: String(err.message || err) });
+    console.error("[crawl] fatal:", err);
+    return res.status(500).json({ ok: false, error: String(err) });
   }
 }
