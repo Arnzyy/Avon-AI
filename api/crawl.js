@@ -1,7 +1,7 @@
 // /api/crawl.js
 // Node 18 / ESM (package.json has "type": "module")
 
-import cheerio from "cheerio";
+import { load } from "cheerio";
 import { createClient } from "@supabase/supabase-js";
 
 // --------- Config ---------
@@ -78,7 +78,7 @@ function extractVdpLinks(listHtml, baseUrl) {
 
 // Extract data from a VDP page (best-effort & resilient)
 function extractVehicleFromVdp(html, vdpUrl) {
-  const $ = cheerio.load(html);
+  const $ = load(html);
 
   // Title: og:title or h1 fallback
   const ogTitle = $('meta[property="og:title"]').attr("content");
