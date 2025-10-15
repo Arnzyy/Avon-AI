@@ -1,103 +1,84 @@
 // /api/chat.js
-import { createClient } from '@supabase/supabase-js';
+import { supabase } from "../lib/supabase.js";
 
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE,
-  { auth: { persistSession: false } }
-);
+const DEFAULT_DEALER = "avon";
 
-function extractMaxPrice(text) {
-  const m = text.match(/(?:under|below|less than)\s*£?\s*([\d,]+)/i) || text.match(/£\s*([\d,]+)/);
-  if (!m) return null;
-  return parseInt(String(m[1]).replace(/,/g, ''), 10);
+function parseQuery(q) {
+  if (!q) return [];
+  return q
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]/gu, " ")
+    .split(/\s+/)
+    .filter(Boolean);
 }
 
-async function searchVehicles(message) {
-  const maxPrice = extractMaxPrice(message);
+async function searchInventory(message, dealer = DEFAULT_DEALER) {
   let query = supabase
-    .from('vehicles')
-    .select('id, title, price, vdp_url, attrs')
-    .order('price', { ascending: true })
-    .limit(10);
+    .from("vehicles")
+    .select("dealer_id, vdp_url, title, price, attrs, first_seen", { count: "exact" })
+    .eq("dealer_id", dealer)
+    .order("first_seen", { ascending: false, nullsFirst: false })
+    .limit(24);
 
-  if (message) query = query.ilike('title', `%${message}%`);
-  if (maxPrice) query = query.lte('price', maxPrice);
+  const tokens = parseQuery(message);
+  for (const t of tokens) {
+    query = query.or(`title.ilike.%${t}%,vdp_url.ilike.%${t}%`);
+  }
 
-  const { data, error } = await query;
-  if (error) throw error;
+  const { data, error, count } = await query;
+  if (error) throw new Error(error.message);
 
-  return data?.map(v => ({
-    title: v.title,
-    price: v.price,
-    url: v.vdp_url,
-    fuel: v.attrs?.fuel,
-    ulez: v.attrs?.ulez,
-    mileage: v.attrs?.mileage
-  })) || [];
+  return { results: data || [], count: count ?? data?.length ?? 0 };
 }
 
-function formatReply(results, query) {
-  if (!results.length)
-    return `I couldn’t find any results matching “${query}”. Try giving me a make or model name, like “Ford Ranger” or a price range such as “under £15,000”.`;
-
-  const items = results.map(v => {
-    const tags = [];
-    if (v.fuel) tags.push(v.fuel);
-    if (v.ulez) tags.push("ULEZ");
-    return `• **${v.title}** — £${v.price.toLocaleString()}${tags.length ? ` (${tags.join(", ")})` : ""} — [View Vehicle](${v.url})`;
-  });
-
-  return `Here’s what I found:\n\n${items.join("\n")}\n\nWould you like a finance example? Just say “finance £DEPOSIT term 48 months”.`;
+function formatResults(results, max = 8) {
+  const take = results.slice(0, max);
+  return take
+    .map((r, i) => {
+      const price =
+        typeof r.price === "number"
+          ? ` – £${r.price.toLocaleString()}`
+          : "";
+      const title = r.title || "View vehicle";
+      return `${i + 1}. ${title}${price}\n   ${r.vdp_url}`;
+    })
+    .join("\n");
 }
 
 export default async function handler(req, res) {
   try {
-    const { message } = JSON.parse(req.body || '{}');
-    if (!message) return res.status(400).json({ reply: 'Please enter a search query.' });
+    const body = typeof req.body === "string" ? JSON.parse(req.body || "{}") : (req.body || {});
+    const message = String(body.message || body.q || "").trim();
+    const dealer = (body.dealer || req.query.dealer || DEFAULT_DEALER).toLowerCase();
 
-    const results = await searchVehicles(message);
-
-    // If OpenAI key exists, make a smart reply using the search data
-    if (process.env.OPENAI_API_KEY) {
-      try {
-        const response = await fetch('https://api.openai.com/v1/chat/completions', {
-          method: 'POST',
-          headers: {
-            'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`,
-            'Content-Type': 'application/json'
-          },
-          body: JSON.stringify({
-            model: process.env.OPENAI_MODEL || 'gpt-4o-mini',
-            messages: [
-              {
-                role: 'system',
-                content: `You are a polite, knowledgeable assistant for a used car dealership. Only use the data provided.`
-              },
-              {
-                role: 'user',
-                content: `User asked: "${message}"\n\nResults:\n${JSON.stringify(results).slice(0, 6000)}`
-              }
-            ],
-            temperature: 0.2
-          })
-        });
-
-        const json = await response.json();
-        const reply = json?.choices?.[0]?.message?.content;
-        if (reply) return res.status(200).json({ reply });
-      } catch (error) {
-        console.warn('OpenAI failed, fallback reply used');
-      }
+    if (!message) {
+      return res.json({
+        reply:
+          "Hi! I can check stock at Avon Automotive. Ask me something like “Ford Ranger under £20k” or “electric cars in Bristol”."
+      });
     }
 
-    // Fallback reply (if OpenAI quota or off)
-    const reply = formatReply(results, message);
-    return res.status(200).json({ reply });
-  } catch (err) {
-    console.error('chat error', err);
+    const { results, count } = await searchInventory(message, dealer);
+
+    if (!count) {
+      return res.json({
+        reply:
+          "I didn't find anything that matches that. Try a simpler search like “ranger”, “ford ranger”, or include a budget (e.g., “under £15k”)."
+      });
+    }
+
+    const list = formatResults(results, 8);
+    const preface =
+      count > 8
+        ? `I found ${count} matches. Here are the first ${Math.min(8, count)}:\n`
+        : `I found ${count} ${count === 1 ? "match" : "matches"}:\n`;
+
+    return res.json({ reply: `${preface}${list}` });
+  } catch (e) {
+    console.error("[chat] fatal:", e);
     return res.status(500).json({
-      reply: "There was an issue fetching results. Please try again shortly."
+      reply:
+        "Sorry—something went wrong on my side. Try again with a simpler search, like “ranger” or “hybrid under 10k”."
     });
   }
 }
