@@ -1,33 +1,47 @@
 // /api/crawl.js
 import * as cheerio from 'cheerio';
-import fetch from 'node-fetch';
 import { createClient } from '@supabase/supabase-js';
 
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
-  auth: { persistSession: false }
+// ----- Environment validation (clear errors instead of cryptic crash) -----
+const { SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY } = process.env;
+
+function envOrThrow(name, value) {
+  if (!value || String(value).trim() === '') {
+    // Surface which var is missing right in the response/logs
+    throw new Error(`Missing environment variable: ${name}`);
+  }
+  return value;
+}
+
+const url = envOrThrow('SUPABASE_URL', SUPABASE_URL);
+// You can use ANON or SERVICE ROLE — this code expects SERVICE ROLE.
+// If you prefer ANON, just pass SUPABASE_ANON_KEY below and ensure RLS allows it.
+const key = envOrThrow('SUPABASE_SERVICE_ROLE_KEY', SUPABASE_SERVICE_ROLE_KEY);
+
+const supabase = createClient(url, key, {
+  auth: { persistSession: false },
+  // Make sure the client uses the same fetch as the runtime (Node 18 has global fetch)
+  global: { fetch },
 });
 
-/** Map slug->dealer config */
+/** Dealer configuration */
 const DEALERS = {
   avon: {
     id: 'avon',
     listUrls: [
-      'https://www.avon-automotive.com/used/cars',  // page 1
-      // add more pages if needed
+      'https://www.avon-automotive.com/used/cars',
+      // Add ?page=2,3... here if you want more pages
     ],
-    // selectors may change—tweak if site markup differs
     selectors: {
       card: '.vehicle-card, .stocklist__item, .card',
       title: '.vehicle-title, .stocklist__title, h3, .card__title',
       price: '.vehicle-price, .stocklist__price, .price, .card__price',
-      link: 'a[href]'
-    }
-  }
+      link: 'a[href]',
+    },
+  },
 };
 
-// basic normalization that helps “ranger” match “Ford Ranger”
+// Normalize helps “ranger” search match “Ford Ranger”
 function normalizeTitle(title) {
   const t = title.toLowerCase();
   if (t.includes('ranger') && !t.includes('ford')) return `Ford ${title}`;
@@ -38,28 +52,34 @@ async function crawlDealer(dealer) {
   const out = [];
 
   for (const url of dealer.listUrls) {
-    const res = await fetch(url, { headers: { 'user-agent': 'Mozilla/5.0' }});
+    let res;
+    try {
+      res = await fetch(url, { headers: { 'user-agent': 'Mozilla/5.0' } });
+    } catch (e) {
+      console.warn('Fetch error:', url, e?.message || e);
+      continue;
+    }
+
     if (!res.ok) {
       console.warn('Fetch failed', url, res.status);
       continue;
     }
+
     const html = await res.text();
     const $ = cheerio.load(html);
 
     $(dealer.selectors.card).each((_, el) => {
       const titleRaw =
-        $(el).find(dealer.selectors.title).text().trim() ||
-        $(el).find('h3').text().trim();
+        $(el).find(dealer.selectors.title).first().text().trim() ||
+        $(el).find('h3').first().text().trim();
 
       if (!titleRaw) return;
 
       const title = normalizeTitle(titleRaw);
-      const priceText =
-        $(el).find(dealer.selectors.price).text().trim() || '';
-      const vdpRel = $(el).find(dealer.selectors.link).attr('href') || '';
-      const vdp_url = vdpRel.startsWith('http')
-        ? vdpRel
-        : new URL(vdpRel, url).toString();
+
+      const priceText = $(el).find(dealer.selectors.price).first().text().trim() || '';
+      const href = $(el).find(dealer.selectors.link).attr('href') || '';
+      const vdp_url = href.startsWith('http') ? href : new URL(href, url).toString();
 
       // parse number out of price string
       const match = priceText.replace(/[,£]/g, '').match(/\d{3,}/);
@@ -70,7 +90,7 @@ async function crawlDealer(dealer) {
         vdp_url,
         title,
         price,
-        attrs: { source_url: url, price_text: priceText }
+        attrs: { source_url: url, price_text: priceText },
       });
     });
   }
@@ -80,17 +100,27 @@ async function crawlDealer(dealer) {
 
 async function upsertVehicles(rows) {
   if (!rows.length) return { inserted: 0 };
-  // batch to avoid payload limits
+
+  // Upsert in batches to avoid payload limits
   const batchSize = 500;
   let inserted = 0;
 
   for (let i = 0; i < rows.length; i += batchSize) {
     const slice = rows.slice(i, i + batchSize);
+
     const { error, count } = await supabase
       .from('vehicles')
-      .upsert(slice, { onConflict: 'vdp_url', ignoreDuplicates: false, count: 'exact' });
+      .upsert(slice, {
+        onConflict: 'vdp_url', // requires a unique index/constraint on vdp_url
+        ignoreDuplicates: false,
+        count: 'exact',
+      });
 
-    if (error) throw error;
+    if (error) {
+      // surface the DB error so you can see it in Vercel logs
+      throw new Error(`Supabase upsert failed: ${error.message}`);
+    }
+
     inserted += count || 0;
   }
 
@@ -99,7 +129,7 @@ async function upsertVehicles(rows) {
 
 export default async function handler(req, res) {
   try {
-    const dealerKey = (req.query.dealer || 'avon').toLowerCase();
+    const dealerKey = String(req.query.dealer || 'avon').toLowerCase();
     const dealer = DEALERS[dealerKey];
     if (!dealer) return res.status(400).json({ ok: false, error: 'Unknown dealer' });
 
@@ -110,10 +140,13 @@ export default async function handler(req, res) {
       ok: true,
       dealer: dealerKey,
       found: rows.length,
-      inserted: summary.inserted
+      inserted: summary.inserted,
     });
   } catch (err) {
-    console.error(err);
-    return res.status(500).json({ ok: false, error: err.message });
+    console.error('[crawl] error:', err);
+    return res.status(500).json({
+      ok: false,
+      error: err?.message || String(err),
+    });
   }
 }
