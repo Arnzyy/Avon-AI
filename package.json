@@ -1,7 +1,15 @@
 {
+  "name": "avon-ai",
+  "version": "1.0.0",
+  "private": true,
   "type": "module",
+  "scripts": {
+    "build": "echo \"no build\"",
+    "start": "vercel dev"
+  },
   "dependencies": {
-    "@supabase/supabase-js": "^2.43.0",
-    "cheerio": "^1.0.0-rc.12"
+    "@supabase/supabase-js": "^2.45.4",
+    "cheerio": "^1.0.0-rc.12",
+    "node-fetch": "^3.3.2"
   }
 }
